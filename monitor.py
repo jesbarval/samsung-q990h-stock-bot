@@ -1,8 +1,8 @@
-"""Vigila el stock oficial de Samsung HW-Q990H/XC y avisa por Telegram.
+"""Vigila el stock oficial de Samsung HW-Q990H/XC y avisa por correo electrónico.
 
 Uso:
   python monitor.py --check-only    # consultar sin notificar
-  python monitor.py --send-test     # enviar un Telegram de prueba
+  python monitor.py --send-test     # enviar un email de prueba
   python monitor.py                 # comprobar y enviar alerta si aparece stock
 
 El estado persistente (state.json) solo cambia cuando se confirma una transición
@@ -116,40 +116,49 @@ def inspect_samsung() -> tuple[Stock, str]:
             browser.close()
 
 
-def send_telegram(message: str) -> None:
-    """Envía Telegram y muestra el motivo de fallo SIN exponer el token."""
-    token = os.environ.get("TELEGRAM_BOT_TOKEN")
-    chat_id = os.environ.get("TELEGRAM_CHAT_ID")
-    if not token or not chat_id:
-        raise RuntimeError("Faltan TELEGRAM_BOT_TOKEN o TELEGRAM_CHAT_ID en GitHub Secrets")
-    try:
-        response = requests.post(
-            f"https://api.telegram.org/bot{token}/sendMessage",
-            data={
-                "chat_id": chat_id,
-                "text": message,
-                "disable_web_page_preview": "true",
-            },
-            timeout=20,
-        )
-    except requests.exceptions.Timeout as error:
-        raise RuntimeError("Telegram no respondió en 20 segundos (timeout)") from None
-    except requests.exceptions.RequestException as error:
-        # Evitamos imprimir 'error': las excepciones de requests incluyen la URL con token.
-        raise RuntimeError(f"Error de conexión con Telegram ({type(error).__name__})") from None
+def send_email(subject: str, message: str) -> None:
+    """Envía un correo a la misma dirección que se utilizó para abrir Resend.
 
-    try:
-        result = response.json()
-    except ValueError:
-        raise RuntimeError(f"Telegram devolvió HTTP {response.status_code}, pero no JSON") from None
+    No se necesita la contraseña de Hotmail. La API key nunca se imprime ni
+    se incluye en la URL, y GitHub la inyecta mediante un secret.
+    """
+    api_key = os.environ.get("RESEND_API_KEY", "").strip()
+    recipient = os.environ.get("EMAIL_TO", "").strip()
+    if not api_key or not recipient:
+        raise RuntimeError("Faltan RESEND_API_KEY o EMAIL_TO en los secretos de GitHub")
+    if not re.fullmatch(r"[^\s@]+@[^\s@]+\.[^\s@]+", recipient):
+        raise RuntimeError("EMAIL_TO debe ser un correo electrónico válido")
 
-    if not response.ok or not isinstance(result, dict) or not result.get("ok", False):
-        description = (result.get("description", "Respuesta rechazada")
-                       if isinstance(result, dict) else "Respuesta no válida")
-        # La API puede devolver mensajes no confiables; limpiamos secretos y caracteres.
-        description = str(description).replace(token, "[TOKEN OCULTO]").replace(chat_id, "[CHAT OCULTO]")
-        description = re.sub(r"[\r\n\t]+", " ", description)[:220]
-        raise RuntimeError(f"Telegram HTTP {response.status_code}: {description}")
+    response = requests.post(
+        "https://api.resend.com/emails",
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        },
+        json={
+            "from": "Alerta Samsung Q990H <onboarding@resend.dev>",
+            "to": [recipient],
+            "subject": subject,
+            "text": message,
+        },
+        timeout=25,
+    )
+    if not response.ok:
+        if response.status_code == 403:
+            raise RuntimeError(
+                "Resend HTTP 403: regístrate en Resend con el MISMO Hotmail "
+                "que has puesto como EMAIL_TO, o verifica un dominio remitente"
+            )
+        if response.status_code == 401:
+            raise RuntimeError("Resend HTTP 401: revisa RESEND_API_KEY")
+        raise RuntimeError(f"Resend HTTP {response.status_code}: no se pudo enviar el correo")
+    try:
+        data = response.json()
+    except ValueError as exc:
+        raise RuntimeError("Resend devolvió una respuesta no válida") from exc
+    if not data.get("id"):
+        raise RuntimeError("Resend no confirmó la aceptación del correo")
+
 
 def load_status() -> Stock:
     try:
@@ -171,42 +180,41 @@ def should_notify(previous: Stock, current: Stock) -> bool:
 
 
 def run() -> int:
-    parser = argparse.ArgumentParser(description="Alerta Samsung HW-Q990H por Telegram")
-    parser.add_argument("--check-only", action="store_true", help="No envía ni modifica estado")
-    parser.add_argument("--send-test", action="store_true", help="Envía un mensaje de prueba")
+    parser = argparse.ArgumentParser(description="Alerta Samsung HW-Q990H por Hotmail")
+    parser.add_argument("--check-only", action="store_true", help="Comprueba sin notificar")
+    parser.add_argument("--send-test", action="store_true", help="Envía correo de prueba")
     args = parser.parse_args()
 
     if args.send_test:
-        send_telegram("✅ Bot Samsung HW-Q990H conectado. Recibirás avisos cuando haya stock.")
-        print("Mensaje de prueba enviado.")
+        send_email(
+            "✅ Prueba del aviso Samsung HW-Q990H",
+            "El aviso por email funciona. GitHub comprobará la Samsung HW-Q990H/XC "
+            "cada 5 minutos (las ejecuciones pueden retrasarse).",
+        )
+        print("Correo de prueba aceptado por Resend (revisar Hotmail y Correo no deseado).")
         return 0
 
     status, detail = inspect_samsung()
     print(f"Samsung HW-Q990H/XC — {status}: {detail}")
     if args.check_only:
         return 0
-
     previous = load_status()
     if status == "unknown":
-        print("No hay evidencia suficiente. No cambiar estado ni enviar avisos.")
+        print("Resultado incierto. No se cambia el estado y no se envía ninguna alerta.")
         return 0
-
     if should_notify(previous, status):
-        print("¡Stock detectado! Intentando enviar alerta por Telegram…")
-        send_telegram(
-            "🔔 ¡La Samsung HW-Q990H/XC vuelve a tener stock en Samsung España!\n"
-            "Compruébalo cuanto antes aquí:\n"
-            + PRODUCT_URL
+        send_email(
+            "🔔 ¡Samsung HW-Q990H DISPONIBLE!",
+            "¡La Samsung HW-Q990H/XC parece estar de nuevo disponible en Samsung España!\n\n"
+            "Comprueba la compra aquí:\n" + PRODUCT_URL + "\n\n"
+            "Aviso automático; verifica la disponibilidad real antes de comprar.",
         )
-        print("Alerta aceptada por Telegram.")
+        print("Se ha aceptado el aviso de stock por email.")
     elif status == "available":
-        print("Sigue disponible; aviso ya enviado. No repetir.")
+        print("La barra sigue disponible y el aviso ya se envió; no repetir.")
     else:
-        print("Sin stock. Volver a revisar en la siguiente ejecución.")
-
+        print("Sin stock. Se volverá a revisar en la próxima ejecución.")
     if status != previous:
-        # Solo persistir cuando cambia: evita ~288 commits por día y mantiene el
-        # estado previo si la notificación falla (para reintentar después).
         save_status(status)
         print("Estado actualizado.")
     return 0
@@ -216,10 +224,9 @@ if __name__ == "__main__":
     try:
         sys.exit(run())
     except Exception as exc:
-        # send_telegram transforma los errores de red en mensajes sin token.
-        # Los errores inesperados se indican solo por su tipo para no filtrar secretos.
+        # No imprimir excepciones de requests: podrían contener datos sensibles.
         if isinstance(exc, RuntimeError):
             print(f"ERROR: {exc}", file=sys.stderr)
         else:
-            print(f"ERROR: {type(exc).__name__}: consulta el código del bot.", file=sys.stderr)
+            print(f"ERROR: {type(exc).__name__}: fallo al ejecutar el monitor", file=sys.stderr)
         sys.exit(1)
