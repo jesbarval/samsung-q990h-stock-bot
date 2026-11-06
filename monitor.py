@@ -117,28 +117,39 @@ def inspect_samsung() -> tuple[Stock, str]:
 
 
 def send_telegram(message: str) -> None:
+    """Envía Telegram y muestra el motivo de fallo SIN exponer el token."""
     token = os.environ.get("TELEGRAM_BOT_TOKEN")
     chat_id = os.environ.get("TELEGRAM_CHAT_ID")
     if not token or not chat_id:
-        raise RuntimeError("Faltan TELEGRAM_BOT_TOKEN o TELEGRAM_CHAT_ID en Secrets")
-    # En POST body, no en query string, para evitar exponer el mensaje en la URL.
-    response = requests.post(
-        f"https://api.telegram.org/bot{token}/sendMessage",
-        data={
-            "chat_id": chat_id,
-            "text": message,
-            "disable_web_page_preview": "true",
-        },
-        timeout=20,
-    )
-    if not response.ok:
-        raise RuntimeError(f"Telegram respondió HTTP {response.status_code}")
+        raise RuntimeError("Faltan TELEGRAM_BOT_TOKEN o TELEGRAM_CHAT_ID en GitHub Secrets")
     try:
-        if not response.json().get("ok", False):
-            raise RuntimeError("Telegram no aceptó el mensaje")
-    except ValueError as error:
-        raise RuntimeError("Telegram no devolvió JSON válido") from error
+        response = requests.post(
+            f"https://api.telegram.org/bot{token}/sendMessage",
+            data={
+                "chat_id": chat_id,
+                "text": message,
+                "disable_web_page_preview": "true",
+            },
+            timeout=20,
+        )
+    except requests.exceptions.Timeout as error:
+        raise RuntimeError("Telegram no respondió en 20 segundos (timeout)") from None
+    except requests.exceptions.RequestException as error:
+        # Evitamos imprimir 'error': las excepciones de requests incluyen la URL con token.
+        raise RuntimeError(f"Error de conexión con Telegram ({type(error).__name__})") from None
 
+    try:
+        result = response.json()
+    except ValueError:
+        raise RuntimeError(f"Telegram devolvió HTTP {response.status_code}, pero no JSON") from None
+
+    if not response.ok or not isinstance(result, dict) or not result.get("ok", False):
+        description = (result.get("description", "Respuesta rechazada")
+                       if isinstance(result, dict) else "Respuesta no válida")
+        # La API puede devolver mensajes no confiables; limpiamos secretos y caracteres.
+        description = str(description).replace(token, "[TOKEN OCULTO]").replace(chat_id, "[CHAT OCULTO]")
+        description = re.sub(r"[\r\n\t]+", " ", description)[:220]
+        raise RuntimeError(f"Telegram HTTP {response.status_code}: {description}")
 
 def load_status() -> Stock:
     try:
@@ -205,6 +216,10 @@ if __name__ == "__main__":
     try:
         sys.exit(run())
     except Exception as exc:
-        # No imprimir excepciones de requests, ya que pueden incluir la URL/token.
-        print(f"ERROR: {type(exc).__name__}: no se completó la operación.", file=sys.stderr)
+        # send_telegram transforma los errores de red en mensajes sin token.
+        # Los errores inesperados se indican solo por su tipo para no filtrar secretos.
+        if isinstance(exc, RuntimeError):
+            print(f"ERROR: {exc}", file=sys.stderr)
+        else:
+            print(f"ERROR: {type(exc).__name__}: consulta el código del bot.", file=sys.stderr)
         sys.exit(1)
